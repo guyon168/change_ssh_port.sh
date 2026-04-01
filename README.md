@@ -10,17 +10,17 @@ chmod +x main.sh
 
 ```
 
-···
+```
 sudo ./main.sh --help    # 查看帮助
-···
+```
 
 
-···
+```
 sudo ./main.sh -r        # 使用随机端口
-···
+```
 
 
-···
+```
 sudo ./main.sh 2222      # 使用指定端口2222
 
 ```
