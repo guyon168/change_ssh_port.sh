@@ -2,10 +2,11 @@
 
 # SSH端口修改脚本
 # 功能：安全地修改SSH服务端口，包含备份、检查、测试等完整流程
-# 作者：OpenClaw Assistant
+# 优化：出错打印详情、自动回滚、不直接崩溃
 # 版本：2.0
 
-set -euo pipefail
+# 关闭严格退出，改用手动错误处理（解决一出错就停、不打印问题）
+set -uo pipefail
 
 # 颜色输出
 RED='\033[0;31m'
@@ -39,28 +40,6 @@ check_root() {
     fi
 }
 
-# 生成随机端口 (1024-65535之间，避开常见端口)
-generate_random_port() {
-    local common_ports="20 21 22 23 25 53 80 110 143 443 465 587 993 995 3306 3389 5432 6379 8080 8443 9200 27017"
-    local port
-    
-    while true; do
-        # 生成1024-65535的随机数
-        port=$((RANDOM % 64512 + 1024))
-        
-        # 检查是否是常见端口
-        if [[ " $common_ports " =~ " $port " ]]; then
-            continue
-        fi
-        
-        # 检查是否被占用
-        if ! ss -tuln 2>/dev/null | grep -q ":${port}\b"; then
-            echo "$port"
-            return 0
-        fi
-    done
-}
-
 # 检查端口是否有效
 check_port_valid() {
     local port=$1
@@ -73,7 +52,7 @@ check_port_valid() {
         return 1
     fi
     if (( port < 1024 )); then
-        log_warning "选择的是特权端口(<1024)，需要确保无其他服务占用"
+        log_warning "选择的是特权端口(<1024)，确保你了解风险"
     fi
     return 0
 }
@@ -81,7 +60,7 @@ check_port_valid() {
 # 检查端口是否被占用
 check_port_in_use() {
     local port=$1
-    if ss -tuln 2>/dev/null | grep -q ":${port}\b"; then
+    if ss -tuln | grep -q ":${port}\b"; then
         log_error "端口 ${port} 已被占用"
         return 1
     fi
@@ -118,7 +97,7 @@ modify_sshd_config() {
     # 先移除所有Port配置（注释或未注释的）
     sed -i '/^[[:space:]]*Port[[:space:]]/d' "$config_file"
     
-    # 在合适位置添加新的Port配置（在ListenAddress之前或文件开头）
+    # 在合适位置添加新的Port配置
     if grep -q "^ListenAddress" "$config_file"; then
         sed -i "/^ListenAddress/i Port $new_port" "$config_file"
     else
@@ -144,7 +123,7 @@ configure_selinux() {
         return 0
     fi
     
-    if ! sestatus 2>/dev/null | grep -q "Current mode.*enforcing"; then
+    if ! sestatus | grep -q "Current mode.*enforcing"; then
         log_info "SELinux未处于enforcing模式，跳过SELinux配置"
         return 0
     fi
@@ -152,13 +131,13 @@ configure_selinux() {
     log_info "配置SELinux允许端口 $new_port..."
     
     # 检查端口是否已在SSH端口类型中
-    if semanage port -l 2>/dev/null | grep -q "ssh_port_t.*${new_port}\b"; then
+    if semanage port -l | grep -q "ssh_port_t.*${new_port}\b"; then
         log_info "SELinux已允许端口 $new_port"
         return 0
     fi
     
     # 添加端口
-    if semanage port -a -t ssh_port_t -p tcp "$new_port" 2>/dev/null; then
+    if semanage port -a -t ssh_port_t -p tcp "$new_port"; then
         log_success "SELinux已配置允许端口 $new_port"
     else
         log_warning "SELinux配置可能需要手动调整"
@@ -170,18 +149,18 @@ configure_firewall() {
     local new_port=$1
     
     # 检查ufw
-    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
         log_info "配置UFW防火墙..."
-        ufw allow "$new_port/tcp" 2>/dev/null || true
+        ufw allow "$new_port/tcp"
         log_success "UFW已允许端口 $new_port"
         return 0
     fi
     
     # 检查firewalld
-    if command -v firewall-cmd &> /dev/null && firewall-cmd --state 2>/dev/null; then
+    if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then
         log_info "配置firewalld防火墙..."
-        firewall-cmd --permanent --add-port="${new_port}/tcp" 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
+        firewall-cmd --permanent --add-port="${new_port}/tcp"
+        firewall-cmd --reload
         log_success "firewalld已允许端口 $new_port"
         return 0
     fi
@@ -192,10 +171,10 @@ configure_firewall() {
 
 # 停止ssh.socket（如果存在）
 stop_ssh_socket() {
-    if systemctl list-unit-files 2>/dev/null | grep -q "ssh.socket"; then
+    if systemctl list-unit-files | grep -q "ssh.socket"; then
         log_info "检测到ssh.socket，正在停止并禁用..."
-        systemctl stop ssh.socket 2>/dev/null || true
-        systemctl disable ssh.socket 2>/dev/null || true
+        systemctl stop ssh.socket || true
+        systemctl disable ssh.socket || true
         log_success "ssh.socket已停止并禁用"
     fi
 }
@@ -225,12 +204,12 @@ verify_port_listening() {
     log_info "验证端口 $port 是否正在监听..."
     
     while (( attempt <= max_attempts )); do
-        if ss -tuln 2>/dev/null | grep -q ":${port}\b"; then
+        if ss -tuln | grep -q ":${port}\b"; then
             log_success "端口 $port 正在监听"
             return 0
         fi
         log_info "等待端口启动... (${attempt}/${max_attempts})"
-        sleep 2
+        sleep 1
         (( attempt++ ))
     done
     
@@ -241,72 +220,37 @@ verify_port_listening() {
 # 回滚函数
 rollback() {
     local backup_file=$1
-    log_warning "正在执行回滚操作..."
+    log_warning "=================================================="
+    log_warning "执行失败，正在自动回滚SSH配置..."
+    log_warning "=================================================="
     
     if [[ -n $backup_file && -f $backup_file ]]; then
         cp "$backup_file" "/etc/ssh/sshd_config"
         log_success "配置已从备份恢复"
-        systemctl restart sshd 2>/dev/null || true
-        log_info "SSH服务已重启"
+        
+        systemctl restart sshd || true
+        sleep 2
+        if systemctl is-active --quiet sshd; then
+            log_success "SSH服务已恢复正常"
+        else
+            log_warning "SSH服务恢复失败，请手动修复"
+        fi
     else
         log_error "没有可用的备份文件，无法自动回滚"
     fi
-}
 
-# 显示使用帮助
-show_help() {
-    cat << EOF
-用法: $0 [选项] [端口号]
-
-选项:
-    -h, --help      显示帮助信息
-    -r, --random    使用随机端口(1024-65535，避开常见端口)
-
-参数:
-    端口号          指定新的SSH端口(1-65535)
-
-示例:
-    $0 2222                    # 使用指定端口2222
-    $0 -r                      # 使用随机生成的端口
-    $0 --random                # 同上
-    curl -fsSL <脚本URL> | sudo bash -s -- 2222    # 远程执行指定端口
-    curl -fsSL <脚本URL> | sudo bash -s -- -r      # 远程执行随机端口
-
-EOF
+    log_error "脚本执行失败！"
+    exit 1
 }
 
 # 主函数
 main() {
-    local new_port=""
-    local use_random=false
+    local new_port=${1:-}
     
     echo "========================================="
     echo "       SSH 端口修改脚本 v2.0"
     echo "========================================="
     echo
-    
-    # 解析参数
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            -r|--random)
-                use_random=true
-                shift
-                ;;
-            [0-9]*)
-                new_port=$1
-                shift
-                ;;
-            *)
-                log_error "未知参数: $1"
-                show_help
-                exit 1
-                ;;
-        esac
-    done
     
     # 检查root
     check_root
@@ -315,20 +259,10 @@ main() {
     local current_port=$(get_current_port)
     log_info "当前SSH端口: $current_port"
     
-    # 确定新端口
-    if [[ "$use_random" == true ]]; then
-        new_port=$(generate_random_port)
-        log_info "生成的随机端口: $new_port"
-    elif [[ -z $new_port ]]; then
-        # 交互模式：要求用户输入
-        read -p "请输入新的SSH端口 (1-65535, 或直接回车生成随机端口): " input_port
-        
-        if [[ -z $input_port ]]; then
-            new_port=$(generate_random_port)
-            log_info "已生成随机端口: $new_port"
-        else
-            new_port=$input_port
-        fi
+    # 如果没有提供端口，提示输入
+    if [[ -z $new_port ]]; then
+        read -p "请输入新的SSH端口 [默认: 2039]: " input_port
+        new_port=${input_port:-2039}
     fi
     
     # 验证端口
@@ -357,11 +291,15 @@ main() {
     
     # 备份配置
     local backup_file=""
-    backup_file=$(backup_sshd_config) || exit 1
+    backup_file=$(backup_sshd_config)
+    if [[ $? -ne 0 || -z $backup_file ]]; then
+        log_error "备份失败，终止操作"
+        exit 1
+    fi
     
-    # 设置回滚陷阱
-    trap 'rollback "$backup_file"' ERR
-    
+    # ==================== 核心优化：错误捕获 + 自动回滚 ====================
+    trap 'rollback "$backup_file"' SIGINT SIGTERM ERR
+
     # 修改配置
     modify_sshd_config "$new_port" || exit 1
     
@@ -380,8 +318,8 @@ main() {
     # 验证端口监听
     verify_port_listening "$new_port" || exit 1
     
-    # 移除回滚陷阱
-    trap - ERR
+    # 成功：清除回滚陷阱
+    trap - SIGINT SIGTERM ERR
     
     echo
     echo "========================================="
@@ -395,17 +333,10 @@ main() {
     echo
     echo "⚠️  重要提示："
     echo "   1. 不要关闭当前会话！"
-    echo "   2. 新开一个终端窗口测试连接："
-    echo "      ssh -p $new_port user@your-server"
-    echo "   3. 确认新端口可以连接后再关闭当前会话"
-    echo "   4. 如遇到问题，可以从备份恢复："
-    echo "      cp $backup_file /etc/ssh/sshd_config"
-    echo "      systemctl restart sshd"
-    echo "   5. 记得检查云服务商安全组是否已放行 $new_port 端口！"
+    echo "   2. 新开终端测试：ssh -p $new_port user@服务器IP"
+    echo "   3. 确认能登录再关闭当前窗口"
+    echo "   4. 云服务器必须在安全组放行 $new_port 端口！"
     echo
-    
-    # 记录使用的端口到日志（方便查看历史）
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Changed from $current_port to $new_port" >> /var/log/ssh-port-changes.log 2>/dev/null || true
 }
 
 # 运行主函数
